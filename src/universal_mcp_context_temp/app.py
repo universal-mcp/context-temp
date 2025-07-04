@@ -2,14 +2,16 @@ from universal_mcp.applications import APIApplication
 from universal_mcp.integrations import Integration
 from contextlib import contextmanager
 import numpy as np
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-from sqlalchemy import JSON, cast, Float
+from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
+from sqlalchemy import JSON, cast, Float, func
 from pgvector.sqlalchemy import Vector
 from openai import AzureOpenAI
 from typing import Optional, List, Dict, Any
 from universal_mcp_markitdown.app import MarkitdownApp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from universal_mcp_context_temp.settings import settings
+from datetime import datetime, timezone
+
 
 # 5. Collection suppprt / Project support
 # 7. Indexing support ( hnsw index)
@@ -20,9 +22,7 @@ client = AzureOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     api_key=settings.azure_openai_api_key,
 )
-
-VECTOR_DIM = 3072  # Set to your embedding size
-
+VECTOR_DIM = 3072
 _engine = None
 
 def get_engine():
@@ -47,17 +47,40 @@ def get_session():
 
 markitdown = MarkitdownApp()
 
-class Document(SQLModel, table=True):
-    __tablename__ = "documents"
+class DocumentChunk(SQLModel, table=True):
+    """
+    Represents a single chunk of content derived from a SourceDocument.
+    This is the 'child' table.
+    """
+    __tablename__ = "document_chunks"
     id: Optional[int] = Field(default=None, primary_key=True)
-    collection: str = Field(index=True)
+    
     content: str
-    filepath: Optional[str] = Field(default=None, index=False)
     embedding: List[float] = Field(sa_type=Vector(VECTOR_DIM))
-    meta: dict = Field(
-        default_factory=dict,
-        sa_type=JSON,
-    )
+    chunk_sequence: int = Field(index=True) # The order of the chunk
+    meta: dict = Field(default_factory=dict, sa_type=JSON)
+    
+    source_document_id: Optional[int] = Field(default=None, foreign_key="source_documents.id")
+    source_document: "SourceDocument" = Relationship(back_populates="chunks")
+
+
+class SourceDocument(SQLModel, table=True):
+    """
+    Represents a single source document (e.g., a file).
+    This is the 'parent' table.
+    """
+    __tablename__ = "source_documents"
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    filepath: str = Field(index=True, unique=True) # Assuming filepath is a unique identifier
+    collection: str = Field(index=True)
+    chunk_count: int = Field(default=0)
+    meta: dict = Field(default_factory=dict, sa_type=JSON)
+    
+    created_at: datetime = Field(default_factory=datetime.now(timezone.utc), nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.now(timezone.utc), nullable=False)
+    
+    chunks: List[DocumentChunk] = Relationship(back_populates="source_document", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
 class ContextApp(APIApplication):
     """
@@ -66,103 +89,117 @@ class ContextApp(APIApplication):
     def __init__(self, integration: Integration = None, **kwargs) -> None:
         super().__init__(name="context", integration=integration, **kwargs)
 
-
-    async def insert_document(self, collection, content: str = None, filepath: str = None, metadata=None) -> List[int]:
+    def _get_or_create_source_document(self, session: Session, collection: str, filepath: str, metadata: dict) -> SourceDocument:
         """
-        Adds a document to the context, automatically chunking it if it's large.
+        Helper function to either retrieve an existing document or create a new one.
+        If the document already exists, its old chunks are deleted.
+        """
+        stmt = select(SourceDocument).where(SourceDocument.filepath == filepath)
+        existing_doc = session.exec(stmt).first()
+
+        if existing_doc:
+            existing_doc.chunks.clear()
+            existing_doc.meta = metadata # Update metadata
+            existing_doc.updated_at = datetime.now(timezone.utc)
+            return existing_doc
+        else:
+            # Document does not exist, create a new one
+            new_doc = SourceDocument(
+                filepath=filepath,
+                collection=collection,
+                meta=metadata or {},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc)
+            )
+            session.add(new_doc)
+            return new_doc
+
+
+    async def insert_document(self, collection, content: str = None, filepath: str = None, metadata=None) -> int:
+        """
+        Adds or updates a document in the context, chunking it and storing it
+        in a relational schema.
 
         Args:
-            collection (str): The name of the collection to which the document belongs.
-            content (str, optional): The content of the document. Required if filepath is not provided.
-            filepath (str, optional): The path to the document file. If provided, its content will be extracted.
-            metadata (dict, optional): Base metadata to associate with the document and all its chunks.
+            collection (str): The name of the collection for the document.
+            content (str, optional): The content of the document.
+            filepath (str, optional): The path to the document file. This is now the
+                                     preferred and unique identifier for a document.
+            metadata (dict, optional): Base metadata for the source document.
 
         Returns:
-            List[int]: A list of IDs for all the document chunks that were inserted.
+            int: The ID of the SourceDocument that was created or updated.
 
         Raises:
-            ValueError: If neither content nor filepath is provided.
+            ValueError: If filepath is not provided.
             
         Tags:
             insert, content, document, important
         """
+        if not filepath:
+            raise ValueError("'filepath' is required and must be a unique identifier for the document.")
+
         final_content = ""
-        if filepath:
-            final_content = await markitdown.convert_to_markdown(filepath)
-        elif content:
+        if content:
             final_content = content
         else:
-            raise ValueError("Either 'content' or 'filepath' must be provided.")
+            final_content = await markitdown.convert_to_markdown(filepath)
 
-        # 1. Initialize the text splitter
-        # These values can be tuned. chunk_size is the max size of a chunk.
-        # chunk_overlap keeps some text from the end of the previous chunk at the start of the next.
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-
-        # 2. Split the document content into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(final_content)
 
-        # 3. Process and insert each chunk as a separate document
         with get_session() as session:
+            source_doc = self._get_or_create_source_document(session, collection, filepath, metadata)
             
-            newly_created_docs = []
-            for i, chunk_content in enumerate(chunks):
-                
-                # Generate an embedding for the specific chunk
-                embedding = generate_embedding(chunk_content)
-
-                # Create a copy of user-provided metadata and add chunk-specific info
-                chunk_metadata = (metadata or {}).copy()
-                chunk_metadata.update({
-                    "source_filepath": filepath,
-                    "chunk_number": i + 1,  # Human-friendly chunk number (starts at 1)
-                    "total_chunks": len(chunks)
-                })
-
-                doc = Document(
-                    collection=collection,
-                    content=chunk_content,
-                    filepath=filepath,
-                    embedding=embedding,
-                    meta=chunk_metadata
-                )
-                session.add(doc)
-                newly_created_docs.append(doc)
-
-            # Commit all the new document chunks in a single transaction
             session.commit()
+            session.refresh(source_doc)
 
-            # After committing, refresh each object to get its database-assigned ID
-            for doc in newly_created_docs:
-                session.refresh(doc)
-                
-            # Return the list of all new document IDs
-            return [doc.id for doc in newly_created_docs]
+            new_chunks = []
+            for i, chunk_content in enumerate(chunks):
+                embedding = generate_embedding(chunk_content)
+                chunk = DocumentChunk(
+                    source_document_id=source_doc.id, # Link to the parent
+                    content=chunk_content,
+                    embedding=embedding,
+                    chunk_sequence=i + 1 # Set the order
+                )
+                new_chunks.append(chunk)
 
-    def delete_document(self, doc_id):
+            session.add_all(new_chunks)
+            
+            source_doc.chunk_count = len(chunks)
+            source_doc.updated_at = datetime.now(timezone.utc)
+            session.add(source_doc)
+
+            session.commit()
+            session.refresh(source_doc)
+            
+            return source_doc.id
+
+    def delete_document(self, doc_id: int) -> bool:
         """
-        Deletes a document from the context.
+        Deletes a source document and all of its associated chunks from the context.
 
         Args:
-            doc_id (int): The ID of the document to delete.
+            doc_id (int): The ID of the SourceDocument to delete.
 
         Returns:
-            None
+            bool: True if the document was found and deleted, False otherwise.
         
         Tags:
             delete, important
         """
         with get_session() as session:
-            doc = session.get(Document, doc_id)
-            if doc:
-                session.delete(doc)
-                session.commit()
+            doc_to_delete = session.get(SourceDocument, doc_id)
 
-    def query_similar(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None):
+            if doc_to_delete:
+                session.delete(doc_to_delete)
+                session.commit()
+                return True
+            
+            return False
+            
+    def query_similar(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Queries the context for similar documents, with advanced metadata filtering.
 
@@ -199,7 +236,9 @@ class ContextApp(APIApplication):
         query_embedding = generate_embedding(query)
         
         with get_session() as session:
-            stmt = select(Document).where(Document.collection == collection)
+            stmt = select(DocumentChunk).join(SourceDocument)
+
+            stmt = stmt.where(SourceDocument.collection == collection)
 
             if metadata_filter:
                 for condition in metadata_filter:
@@ -210,7 +249,7 @@ class ContextApp(APIApplication):
                     if not all([field, op, value is not None]):
                         continue
                     
-                    json_field = Document.meta[field]
+                    json_field = SourceDocument.meta[field]
 
                     if op in ('>', 'gt', '>=', 'gte', '<', 'lt', '<=', 'lte'):
                         numeric_field = cast(json_field.as_string(), Float)
@@ -222,21 +261,33 @@ class ContextApp(APIApplication):
                             stmt = stmt.where(numeric_field < value)
                         elif op in ('<=', 'lte'):
                             stmt = stmt.where(numeric_field <= value)
-                    
                     elif op == 'in':
                         if isinstance(value, list):
                             stmt = stmt.where(json_field.as_string().in_([str(v) for v in value]))
-
                     elif op in ('!=', 'ne'):
                         stmt = stmt.where(json_field.as_string() != str(value))
-                    
                     else: # Default case for '==' or 'eq'
                         stmt = stmt.where(json_field.as_string() == str(value))
 
-            stmt = stmt.order_by(Document.embedding.cosine_distance(query_embedding)).limit(top_k)
+            stmt = stmt.order_by(DocumentChunk.embedding.cosine_distance(query_embedding)).limit(top_k)
             
             results = session.exec(stmt).all()
-            return [doc.model_dump(exclude={"embedding"}) for doc in results]
+
+            output = []
+            for chunk in results:
+                output.append({
+                    "chunk_id": chunk.id,
+                    "content": chunk.content,
+                    "chunk_sequence": chunk.chunk_sequence,
+                    "chunk_meta": chunk.meta,
+                    "source_document": {
+                        "id": chunk.source_document.id,
+                        "filepath": chunk.source_document.filepath,
+                        "collection": chunk.source_document.collection,
+                        "meta": chunk.source_document.meta,
+                    }
+                })
+            return output
         
     def list_tools(self):
         """
