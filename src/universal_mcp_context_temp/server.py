@@ -1,9 +1,9 @@
 
 from universal_mcp.servers import SingleMCPServer
 
-from universal_mcp_context_temp.app import ContextTempApp
+from universal_mcp_context_temp.app import ContextApp
 
-app_instance = ContextTempApp()
+app_instance = ContextApp()
 
 mcp = SingleMCPServer(
     app_instance=app_instance
