@@ -82,6 +82,9 @@ class ContextApp(APIApplication):
 
         Raises:
             ValueError: If neither content nor filepath is provided.
+            
+        Tags:
+            insert, content, document, important
         """
         final_content = ""
         if filepath:
@@ -149,6 +152,9 @@ class ContextApp(APIApplication):
 
         Returns:
             None
+        
+        Tags:
+            delete, important
         """
         with get_session() as session:
             doc = session.get(Document, doc_id)
@@ -186,6 +192,9 @@ class ContextApp(APIApplication):
 
         Returns:
             List[dict]: A list of dictionaries representing the similar documents.
+            
+        Tags:
+            query, important
         """
         query_embedding = generate_embedding(query)
         
