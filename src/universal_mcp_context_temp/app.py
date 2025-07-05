@@ -3,7 +3,7 @@ from universal_mcp.integrations import Integration
 from contextlib import contextmanager
 import numpy as np
 from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
-from sqlalchemy import JSON, cast, Float, func
+from sqlalchemy import JSON, cast, Float, func, Index
 from pgvector.sqlalchemy import Vector
 from openai import AzureOpenAI
 from typing import Optional, List, Dict, Any
@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 
 
 # 5. Collection suppprt / Project support
-# 7. Indexing support ( hnsw index)
 # 8. Full text support ( vector + text) , hybrid search
 
 client = AzureOpenAI(
@@ -22,7 +21,7 @@ client = AzureOpenAI(
     azure_endpoint=settings.azure_openai_endpoint,
     api_key=settings.azure_openai_api_key,
 )
-VECTOR_DIM = 3072
+VECTOR_DIM = 1536
 _engine = None
 
 def get_engine():
@@ -63,6 +62,15 @@ class DocumentChunk(SQLModel, table=True):
     source_document_id: Optional[int] = Field(default=None, foreign_key="source_documents.id")
     source_document: "SourceDocument" = Relationship(back_populates="chunks")
 
+    __table_args__ = (
+        Index(
+            'hnsw_index_on_embedding',
+            'embedding',
+            postgresql_using='hnsw',
+            postgresql_with={'m': 16, 'ef_construction': 64},
+            postgresql_ops={'embedding': 'vector_cosine_ops'}
+        ),
+    )
 
 class SourceDocument(SQLModel, table=True):
     """
