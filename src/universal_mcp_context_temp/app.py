@@ -124,99 +124,112 @@ class ContextApp(APIApplication):
             session.add(new_doc)
             return new_doc
 
-    async def insert_document(self, project: str, content: str = None, filepath: str = None, filename: str = None, metadata=None) -> int:
+    def _process_and_store_document(self, session: Session, project: str, source_identifier: str, content: str, metadata: Optional[dict]) -> int:
         """
-        Adds or updates a document in the context.
-        This function supports two primary modes of operation:
-        1.  **By Filepath**: Provide a `filepath` to a document. The content will be loaded
-            from this path, and the `filepath` itself will serve as the unique identifier
-            within the project. If a document with the same `project` and `filepath`
-            already exists, it will be updated.
-        2.  **By Content**: Provide the document's `content` directly. In this mode, you
-            must also provide a `filename`, which will serve as the unique identifier
-            within the project. This allows for readable identification and enables future
-            updates to the document by referencing the same `project` and `filename`.
+        Internal helper to process content, create chunks, and store in the database.
+        """
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_text(content)
+
+        # Get or create the parent document, clearing old chunks if it exists
+        source_doc = self._get_or_create_source_document(session, project, source_identifier, metadata)
+        
+        # We need the ID for the foreign key, so commit and refresh
+        session.commit()
+        session.refresh(source_doc)
+
+        new_chunks = []
+        for i, chunk_content in enumerate(chunks):
+            embedding = generate_embedding(chunk_content)
+            chunk = DocumentChunk(
+                source_document_id=source_doc.id,
+                content=chunk_content,
+                embedding=embedding,
+                chunk_sequence=i + 1
+            )
+            new_chunks.append(chunk)
+
+        session.add_all(new_chunks)
+        
+        # Update the parent document's metadata
+        source_doc.chunk_count = len(chunks)
+        source_doc.updated_at = datetime.now(timezone.utc)
+        session.add(source_doc)
+
+        # Final commit to save chunks and the updated parent
+        session.commit()
+        session.refresh(source_doc)
+        
+        return source_doc.id
+
+    async def insert_document_from_file(self, project: str, filepath: str, metadata: Optional[dict] = None) -> int:
+        """
+        Adds or updates a document in the context from a file path.
+
+        The content will be loaded from the specified path, and the `filepath` itself 
+        will serve as the unique identifier within the project. If a document with the 
+        same `project` and `filepath` already exists, its content and metadata will be updated.
 
         Args:
             project (str): The name of the project to associate with the document.
-            content (str, optional): The raw text content of the document. If provided,
-                                     `filename` must also be specified. Mutually exclusive
-                                     with `filepath`.
-            filepath (str, optional): The path to the document (e.g., file path, URL).
-                                      Mutually exclusive with `content` and `filename`.
-            filename (str, optional): A unique name for the document when providing `content`
-                                      directly. It is used as the `filepath` identifier.
+            filepath (str): The path to the document (e.g., local file path, URL).
             metadata (dict, optional): Base metadata for the source document.
 
         Returns:
             int: The ID of the SourceDocument that was created or updated.
 
         Raises:
-            ValueError: If validation fails. For example:
-                        - If 'filepath' is provided along with 'content' or 'filename'.
-                        - If 'content' is provided without a 'filename'.
-                        - If neither ('content' and 'filename') nor 'filepath' are provided.
-                        - If loading content from the 'filepath' fails.
-            
-        Tags:
-            insert, content, document, important
-        """
-
-        if filepath and (content or filename):
-            raise ValueError("If 'filepath' is provided, 'content' and 'filename' must be omitted.")
-
-        if content and not filename:
-            raise ValueError("If 'content' is provided, you must also provide a 'filename'.")
-
-        if not filepath and not content:
-            raise ValueError("You must provide either 'filepath' or 'content'.")
+            ValueError: If loading or converting content from the filepath fails.
         
-        source_identifier = ""
-        final_content = ""
-
-        if filepath:
-            # Use case: Content is loaded from a path-like identifier.
-            source_identifier = filepath
-            try:
-                final_content = await markitdown.convert_to_markdown(filepath)
-            except Exception as e:
-                raise ValueError(f"Failed to load or convert content from filepath '{filepath}'. Reason: {e}")
-
-        elif content: # We know 'filename' is guaranteed to be present here
-            # Use case: Content is provided directly with a filename.
-            source_identifier = filename
-            final_content = content
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_text(final_content)
+        Tags:
+            insert, content, document, file, important
+        """
+        try:
+            content = await markitdown.convert_to_markdown(filepath)
+        except Exception as e:
+            raise ValueError(f"Failed to load or convert content from filepath '{filepath}'. Reason: {e}")
 
         with get_session() as session:
-            source_doc = self._get_or_create_source_document(session, project, source_identifier, metadata)
-            
-            session.commit()
-            session.refresh(source_doc)
+            doc_id = self._process_and_store_document(
+                session=session,
+                project=project,
+                source_identifier=filepath,
+                content=content,
+                metadata=metadata
+            )
+            return doc_id
 
-            new_chunks = []
-            for i, chunk_content in enumerate(chunks):
-                embedding = generate_embedding(chunk_content)
-                chunk = DocumentChunk(
-                    source_document_id=source_doc.id,
-                    content=chunk_content,
-                    embedding=embedding,
-                    chunk_sequence=i + 1
-                )
-                new_chunks.append(chunk)
+    async def insert_document_from_content(self, project: str, content: str, filename: str, metadata: Optional[dict] = None) -> int:
+        """
+        Adds or updates a document in the context from raw content.
 
-            session.add_all(new_chunks)
-            
-            source_doc.chunk_count = len(chunks)
-            source_doc.updated_at = datetime.now(timezone.utc)
-            session.add(source_doc)
+        You must provide the document's `content` directly and a `filename` which 
+        will serve as the unique identifier within the project. This allows for readable
+        identification and enables future updates to the document by referencing the 
+        same `project` and `filename`.
 
-            session.commit()
-            session.refresh(source_doc)
-            
-            return source_doc.id
+        Args:
+            project (str): The name of the project to associate with the document.
+            content (str): The raw text content of the document.
+            filename (str): A unique name for the document. This is used as the `filepath` 
+                            identifier in the database.
+            metadata (dict, optional): Base metadata for the source document.
+
+        Returns:
+            int: The ID of the SourceDocument that was created or updated.
+        
+        Tags:
+            insert, content, document, text, important
+        """
+        with get_session() as session:
+            doc_id = self._process_and_store_document(
+                session=session,
+                project=project,
+                source_identifier=filename,
+                content=content,
+                metadata=metadata
+            )
+            return doc_id
 
     def delete_document(self, doc_id: int) -> bool:
         """
@@ -404,7 +417,8 @@ class ContextApp(APIApplication):
     def list_tools(self):
         
         return [
-            self.insert_document, 
+            self.insert_document_from_file,
+            self.insert_document_from_content, 
             self.delete_document, 
             self.query_similar,
             self.list_projects,

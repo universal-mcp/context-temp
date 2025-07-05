@@ -9,7 +9,8 @@ This is automatically generated from OpenAPI schema for the ContextApp API.
 
 | Tool | Description |
 |------|-------------|
-| `insert_document` | Adds or updates a document in the context. |
+| `insert_document_from_file` | Adds or updates a document in the context from a file path. |
+| `insert_document_from_content` | Adds or updates a document in the context from raw content. |
 | `delete_document` | Deletes a source document and all of its associated chunks from the context. |
 | `query_similar` | Queries the context for similar documents, with advanced metadata filtering. |
 | `list_projects` | Lists all unique project names available in the context. |
