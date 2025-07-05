@@ -210,10 +210,8 @@ class ContextApp(APIApplication):
     def query_similar(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Queries the context for similar documents, with advanced metadata filtering.
-
         The metadata_filter should be a list of dictionaries, where each dictionary
         defines a single condition.
-        
         Supported operators ('op'):
         - '==' or 'eq': Equals (for strings or numbers)
         - '!=' or 'ne': Not Equals
@@ -222,10 +220,8 @@ class ContextApp(APIApplication):
         - '<' or 'lt': Less Than (for numbers)
         - '<=' or 'lte': Less Than or Equal To (for numbers)
         - 'in': Value is in a list (e.g., {"field": "type", "op": "in", "value": ["pdf", "txt"]})
-
-        Example:
-        metadata_filter = [
-            {"field": "subject", "op": "==", "value": "DSAI"},
+        For example, metadata_filter = [
+            {"field": "author", "op": "==", "value": "Ankit Ranjan"},
             {"field": "chunk_number", "op": ">", "value": 5}
         ]
 
