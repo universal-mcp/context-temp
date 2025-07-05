@@ -335,7 +335,7 @@ class ContextApp(APIApplication):
             List[str]: A list of unique project names.
         
         Tags:
-            list, query, project
+            list, query, project, important
         """
         with get_session() as session:
             stmt = select(SourceDocument.project).distinct()
@@ -355,7 +355,7 @@ class ContextApp(APIApplication):
                                   with its ID, filepath, and other metadata.
         
         Tags:
-            list, query, document
+            list, query, document, important
         """
         with get_session() as session:
             stmt = select(SourceDocument).where(SourceDocument.project == project).order_by(SourceDocument.filepath)
@@ -382,7 +382,7 @@ class ContextApp(APIApplication):
                                   with its ID, project, filepath, and other metadata.
         
         Tags:
-            list, query, document
+            list, query, document, important
         """
         with get_session() as session:
             stmt = select(SourceDocument).order_by(SourceDocument.project, SourceDocument.filepath)
