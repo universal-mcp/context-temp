@@ -327,12 +327,87 @@ class ContextApp(APIApplication):
                 })
             return output
         
+    def list_projects(self) -> List[str]:
+        """
+        Lists all unique project names available in the context.
+
+        Returns:
+            List[str]: A list of unique project names.
+        
+        Tags:
+            list, query, project
+        """
+        with get_session() as session:
+            stmt = select(SourceDocument.project).distinct()
+            results = session.exec(stmt).all()
+
+            return results
+
+    def list_documents_in_project(self, project: str) -> List[Dict[str, Any]]:
+        """
+        Lists all documents (and their metadata) within a specific project.
+
+        Args:
+            project (str): The name of the project to list documents for.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries, each representing a document
+                                  with its ID, filepath, and other metadata.
+        
+        Tags:
+            list, query, document
+        """
+        with get_session() as session:
+            stmt = select(SourceDocument).where(SourceDocument.project == project).order_by(SourceDocument.filepath)
+            documents = session.exec(stmt).all()
+            
+            return [
+                {
+                    "id": doc.id,
+                    "filepath": doc.filepath,
+                    # "chunk_count": doc.chunk_count,
+                    # "meta": doc.meta,
+                    # "created_at": doc.created_at,
+                    # "updated_at": doc.updated_at,
+                }
+                for doc in documents
+            ]
+            
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """
+        Lists all documents across all projects available in the context.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries, each representing a document
+                                  with its ID, project, filepath, and other metadata.
+        
+        Tags:
+            list, query, document
+        """
+        with get_session() as session:
+            stmt = select(SourceDocument).order_by(SourceDocument.project, SourceDocument.filepath)
+            documents = session.exec(stmt).all()
+            
+            return [
+                {
+                    "id": doc.id,
+                    "project": doc.project, # Include the project name for clarity
+                    "filepath": doc.filepath,
+                    # "chunk_count": doc.chunk_count,
+                    # "meta": doc.meta,
+                    # "created_at": doc.created_at,
+                    # "updated_at": doc.updated_at,
+                }
+                for doc in documents
+            ]
+
     def list_tools(self):
-        """
-        Lists the available tools (methods) for this application.
-        """
+        
         return [
             self.insert_document, 
             self.delete_document, 
-            self.query_similar
+            self.query_similar,
+            self.list_projects,
+            self.list_documents_in_project,
+            self.list_documents,
         ]
