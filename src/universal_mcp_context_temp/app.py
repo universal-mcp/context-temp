@@ -80,8 +80,7 @@ class SourceDocument(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
 
     project: str = Field(index=True)
-    filepath: str = Field(index=True) # No longer globally unique
-    collection: str = Field(index=True)
+    filepath: str = Field(index=True) # Unique within a project
     chunk_count: int = Field(default=0)
     meta: dict = Field(default_factory=dict, sa_type=JSON)
     
@@ -100,7 +99,7 @@ class ContextApp(APIApplication):
     def __init__(self, integration: Integration = None, **kwargs) -> None:
         super().__init__(name="context", integration=integration, **kwargs)
 
-    def _get_or_create_source_document(self, session: Session, project: str, collection: str, filepath: str, metadata: dict) -> SourceDocument:
+    def _get_or_create_source_document(self, session: Session, project: str, filepath: str, metadata: dict) -> SourceDocument:
         """
         Helper function to either retrieve an existing document or create a new one.
         If the document already exists, its old chunks are deleted.
@@ -111,7 +110,6 @@ class ContextApp(APIApplication):
         if existing_doc:
             existing_doc.chunks.clear()
             existing_doc.meta = metadata # Update metadata
-            existing_doc.collection = collection # Update collection if it changed
             existing_doc.updated_at = datetime.now(timezone.utc)
             return existing_doc
         else:
@@ -119,7 +117,6 @@ class ContextApp(APIApplication):
             new_doc = SourceDocument(
                 project=project,
                 filepath=filepath,
-                collection=collection,
                 meta=metadata or {},
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc)
@@ -127,7 +124,7 @@ class ContextApp(APIApplication):
             session.add(new_doc)
             return new_doc
 
-    async def insert_document(self, project: str, collection: str, content: str = None, filepath: str = None, filename: str = None, metadata=None) -> int:
+    async def insert_document(self, project: str, content: str = None, filepath: str = None, filename: str = None, metadata=None) -> int:
         """
         Adds or updates a document in the context.
         This function supports two primary modes of operation:
@@ -142,7 +139,6 @@ class ContextApp(APIApplication):
 
         Args:
             project (str): The name of the project to associate with the document.
-            collection (str): The name of the collection for the document.
             content (str, optional): The raw text content of the document. If provided,
                                      `filename` must also be specified. Mutually exclusive
                                      with `filepath`.
@@ -195,7 +191,7 @@ class ContextApp(APIApplication):
         chunks = text_splitter.split_text(final_content)
 
         with get_session() as session:
-            source_doc = self._get_or_create_source_document(session, project, collection, source_identifier, metadata)
+            source_doc = self._get_or_create_source_document(session, project, source_identifier, metadata)
             
             session.commit()
             session.refresh(source_doc)
@@ -245,7 +241,7 @@ class ContextApp(APIApplication):
             
             return False
             
-    def query_similar(self, project: str, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+    def query_similar(self, project: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Queries the context for similar documents, with advanced metadata filtering.
         The metadata_filter should be a list of dictionaries, where each dictionary
@@ -265,7 +261,6 @@ class ContextApp(APIApplication):
 
         Args:
             project (str): The name of the project to search within.
-            collection (str): The name of the collection to search within.
             query (str): The query string to find similar documents.
             top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
             metadata_filter (List[Dict], optional): A list of filter conditions to apply.
@@ -282,7 +277,6 @@ class ContextApp(APIApplication):
             stmt = select(DocumentChunk).join(SourceDocument)
 
             stmt = stmt.where(SourceDocument.project == project)
-            stmt = stmt.where(SourceDocument.collection == collection)
 
             if metadata_filter:
                 for condition in metadata_filter:
@@ -328,7 +322,6 @@ class ContextApp(APIApplication):
                         "id": chunk.source_document.id,
                         "project": chunk.source_document.project,
                         "filepath": chunk.source_document.filepath,
-                        "collection": chunk.source_document.collection,
                         "meta": chunk.source_document.meta,
                     }
                 })
