@@ -165,7 +165,6 @@ class ContextApp(APIApplication):
     async def insert_document_from_file(self, project: str, filepath: str, metadata: Optional[dict] = None) -> int:
         """
         Adds or updates a document in the context from a file path.
-
         The content will be loaded from the specified path, and the `filepath` itself 
         will serve as the unique identifier within the project. If a document with the 
         same `project` and `filepath` already exists, its content and metadata will be updated.
@@ -202,7 +201,6 @@ class ContextApp(APIApplication):
     async def insert_document_from_content(self, project: str, content: str, filename: str, metadata: Optional[dict] = None) -> int:
         """
         Adds or updates a document in the context from raw content.
-
         You must provide the document's `content` directly and a `filename` which 
         will serve as the unique identifier within the project. This allows for readable
         identification and enables future updates to the document by referencing the 
