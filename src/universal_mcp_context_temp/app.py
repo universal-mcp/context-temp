@@ -3,7 +3,7 @@ from universal_mcp.integrations import Integration
 from contextlib import contextmanager
 import numpy as np
 from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
-from sqlalchemy import JSON, cast, Float, func, Index
+from sqlalchemy import JSON, cast, Float, func, Index, UniqueConstraint
 from pgvector.sqlalchemy import Vector
 from openai import AzureOpenAI
 from typing import Optional, List, Dict, Any
@@ -11,9 +11,8 @@ from universal_mcp_markitdown.app import MarkitdownApp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from universal_mcp_context_temp.settings import settings
 from datetime import datetime, timezone
+import uuid
 
-
-# 5. Collection suppprt / Project support
 # 8. Full text support ( vector + text) , hybrid search
 
 client = AzureOpenAI(
@@ -80,7 +79,8 @@ class SourceDocument(SQLModel, table=True):
     __tablename__ = "source_documents"
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    filepath: str = Field(index=True, unique=True) # Assuming filepath is a unique identifier
+    project: str = Field(index=True)
+    filepath: str = Field(index=True) # No longer globally unique
     collection: str = Field(index=True)
     chunk_count: int = Field(default=0)
     meta: dict = Field(default_factory=dict, sa_type=JSON)
@@ -90,6 +90,9 @@ class SourceDocument(SQLModel, table=True):
     
     chunks: List[DocumentChunk] = Relationship(back_populates="source_document", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
+    __table_args__ = (UniqueConstraint('project', 'filepath', name='_project_filepath_uc'),)
+
+
 class ContextApp(APIApplication):
     """
     Base class for Universal MCP Applications.
@@ -97,22 +100,24 @@ class ContextApp(APIApplication):
     def __init__(self, integration: Integration = None, **kwargs) -> None:
         super().__init__(name="context", integration=integration, **kwargs)
 
-    def _get_or_create_source_document(self, session: Session, collection: str, filepath: str, metadata: dict) -> SourceDocument:
+    def _get_or_create_source_document(self, session: Session, project: str, collection: str, filepath: str, metadata: dict) -> SourceDocument:
         """
         Helper function to either retrieve an existing document or create a new one.
         If the document already exists, its old chunks are deleted.
         """
-        stmt = select(SourceDocument).where(SourceDocument.filepath == filepath)
+        stmt = select(SourceDocument).where(SourceDocument.project == project, SourceDocument.filepath == filepath)
         existing_doc = session.exec(stmt).first()
 
         if existing_doc:
             existing_doc.chunks.clear()
             existing_doc.meta = metadata # Update metadata
+            existing_doc.collection = collection # Update collection if it changed
             existing_doc.updated_at = datetime.now(timezone.utc)
             return existing_doc
         else:
             # Document does not exist, create a new one
             new_doc = SourceDocument(
+                project=project,
                 filepath=filepath,
                 collection=collection,
                 meta=metadata or {},
@@ -122,42 +127,61 @@ class ContextApp(APIApplication):
             session.add(new_doc)
             return new_doc
 
-
-    async def insert_document(self, collection, content: str = None, filepath: str = None, metadata=None) -> int:
+    async def insert_document(self, project: str, collection: str, content: str = None, filepath: str = None, metadata=None) -> int:
         """
-        Adds or updates a document in the context, chunking it and storing it
-        in a relational schema.
+        Adds or updates a document in the context.
+        You must provide either 'content' or 'filepath', but not both.
+        - If 'filepath' is provided, it is used as a unique identifier for the document
+          within the project. If a document with the same project and filepath already
+          exists, its content will be re-loaded from the path and updated.
+        - If 'content' is provided, the document is treated as an anonymous, unique
+          entry. It cannot be updated later by this function.
 
         Args:
+            project (str): The name of the project to associate with the document.
             collection (str): The name of the collection for the document.
-            content (str, optional): The content of the document.
-            filepath (str, optional): The path to the document file. This is now the
-                                     preferred and unique identifier for a document.
+            content (str, optional): The raw text content of the document.
+            filepath (str, optional): The path to the document (e.g., file path, URL).
             metadata (dict, optional): Base metadata for the source document.
 
         Returns:
             int: The ID of the SourceDocument that was created or updated.
 
         Raises:
-            ValueError: If filepath is not provided.
+            ValueError: If both 'content' and 'filepath' are provided, or if neither are.
             
         Tags:
             insert, content, document, important
         """
-        if not filepath:
-            raise ValueError("'filepath' is required and must be a unique identifier for the document.")
-
         final_content = ""
-        if content:
+        source_identifier = ""
+
+        # This logic block enforces the "either/or" constraint.
+        if content and filepath:
+            raise ValueError("Provide either 'content' or 'filepath', but not both.")
+        
+        elif content:
+            # Use case: Content is provided directly.
             final_content = content
+            source_identifier = f"anonymous-content-{uuid.uuid4()}"
+
+        elif filepath:
+            # Use case: Content is loaded from a path-like identifier.
+            source_identifier = filepath
+            try:
+                final_content = await markitdown.convert_to_markdown(filepath)
+            except Exception as e:
+                raise ValueError(f"Failed to load or convert content from filepath '{filepath}'. Reason: {e}")
+
         else:
-            final_content = await markitdown.convert_to_markdown(filepath)
+            # Use case: Neither was provided.
+            raise ValueError("You must provide either 'content' or a 'filepath' to insert a document.")
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(final_content)
 
         with get_session() as session:
-            source_doc = self._get_or_create_source_document(session, collection, filepath, metadata)
+            source_doc = self._get_or_create_source_document(session, project, collection, source_identifier, metadata)
             
             session.commit()
             session.refresh(source_doc)
@@ -166,10 +190,10 @@ class ContextApp(APIApplication):
             for i, chunk_content in enumerate(chunks):
                 embedding = generate_embedding(chunk_content)
                 chunk = DocumentChunk(
-                    source_document_id=source_doc.id, # Link to the parent
+                    source_document_id=source_doc.id,
                     content=chunk_content,
                     embedding=embedding,
-                    chunk_sequence=i + 1 # Set the order
+                    chunk_sequence=i + 1
                 )
                 new_chunks.append(chunk)
 
@@ -207,7 +231,7 @@ class ContextApp(APIApplication):
             
             return False
             
-    def query_similar(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+    def query_similar(self, project: str, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Queries the context for similar documents, with advanced metadata filtering.
         The metadata_filter should be a list of dictionaries, where each dictionary
@@ -226,6 +250,7 @@ class ContextApp(APIApplication):
         ]
 
         Args:
+            project (str): The name of the project to search within.
             collection (str): The name of the collection to search within.
             query (str): The query string to find similar documents.
             top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
@@ -242,6 +267,7 @@ class ContextApp(APIApplication):
         with get_session() as session:
             stmt = select(DocumentChunk).join(SourceDocument)
 
+            stmt = stmt.where(SourceDocument.project == project)
             stmt = stmt.where(SourceDocument.collection == collection)
 
             if metadata_filter:
@@ -286,6 +312,7 @@ class ContextApp(APIApplication):
                     "chunk_meta": chunk.meta,
                     "source_document": {
                         "id": chunk.source_document.id,
+                        "project": chunk.source_document.project,
                         "filepath": chunk.source_document.filepath,
                         "collection": chunk.source_document.collection,
                         "meta": chunk.source_document.meta,
@@ -302,4 +329,3 @@ class ContextApp(APIApplication):
             self.delete_document, 
             self.query_similar
         ]
- 
