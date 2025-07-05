@@ -127,45 +127,58 @@ class ContextApp(APIApplication):
             session.add(new_doc)
             return new_doc
 
-    async def insert_document(self, project: str, collection: str, content: str = None, filepath: str = None, metadata=None) -> int:
+    async def insert_document(self, project: str, collection: str, content: str = None, filepath: str = None, filename: str = None, metadata=None) -> int:
         """
         Adds or updates a document in the context.
-        You must provide either 'content' or 'filepath', but not both.
-        - If 'filepath' is provided, it is used as a unique identifier for the document
-          within the project. If a document with the same project and filepath already
-          exists, its content will be re-loaded from the path and updated.
-        - If 'content' is provided, the document is treated as an anonymous, unique
-          entry. It cannot be updated later by this function.
+        This function supports two primary modes of operation:
+        1.  **By Filepath**: Provide a `filepath` to a document. The content will be loaded
+            from this path, and the `filepath` itself will serve as the unique identifier
+            within the project. If a document with the same `project` and `filepath`
+            already exists, it will be updated.
+        2.  **By Content**: Provide the document's `content` directly. In this mode, you
+            must also provide a `filename`, which will serve as the unique identifier
+            within the project. This allows for readable identification and enables future
+            updates to the document by referencing the same `project` and `filename`.
 
         Args:
             project (str): The name of the project to associate with the document.
             collection (str): The name of the collection for the document.
-            content (str, optional): The raw text content of the document.
+            content (str, optional): The raw text content of the document. If provided,
+                                     `filename` must also be specified. Mutually exclusive
+                                     with `filepath`.
             filepath (str, optional): The path to the document (e.g., file path, URL).
+                                      Mutually exclusive with `content` and `filename`.
+            filename (str, optional): A unique name for the document when providing `content`
+                                      directly. It is used as the `filepath` identifier.
             metadata (dict, optional): Base metadata for the source document.
 
         Returns:
             int: The ID of the SourceDocument that was created or updated.
 
         Raises:
-            ValueError: If both 'content' and 'filepath' are provided, or if neither are.
+            ValueError: If validation fails. For example:
+                        - If 'filepath' is provided along with 'content' or 'filename'.
+                        - If 'content' is provided without a 'filename'.
+                        - If neither ('content' and 'filename') nor 'filepath' are provided.
+                        - If loading content from the 'filepath' fails.
             
         Tags:
             insert, content, document, important
         """
-        final_content = ""
-        source_identifier = ""
 
-        # This logic block enforces the "either/or" constraint.
-        if content and filepath:
-            raise ValueError("Provide either 'content' or 'filepath', but not both.")
+        if filepath and (content or filename):
+            raise ValueError("If 'filepath' is provided, 'content' and 'filename' must be omitted.")
+
+        if content and not filename:
+            raise ValueError("If 'content' is provided, you must also provide a 'filename'.")
+
+        if not filepath and not content:
+            raise ValueError("You must provide either 'filepath' or 'content'.")
         
-        elif content:
-            # Use case: Content is provided directly.
-            final_content = content
-            source_identifier = f"anonymous-content-{uuid.uuid4()}"
+        source_identifier = ""
+        final_content = ""
 
-        elif filepath:
+        if filepath:
             # Use case: Content is loaded from a path-like identifier.
             source_identifier = filepath
             try:
@@ -173,9 +186,10 @@ class ContextApp(APIApplication):
             except Exception as e:
                 raise ValueError(f"Failed to load or convert content from filepath '{filepath}'. Reason: {e}")
 
-        else:
-            # Use case: Neither was provided.
-            raise ValueError("You must provide either 'content' or a 'filepath' to insert a document.")
+        elif content: # We know 'filename' is guaranteed to be present here
+            # Use case: Content is provided directly with a filename.
+            source_identifier = filename
+            final_content = content
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(final_content)
