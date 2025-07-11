@@ -1,9 +1,9 @@
 from universal_mcp.applications import APIApplication
 from universal_mcp.integrations import Integration
 from contextlib import contextmanager
-import numpy as np
 from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
-from sqlalchemy import JSON, cast, Float, func, Index, UniqueConstraint
+from sqlalchemy import JSON, cast, Float, func, Index, UniqueConstraint, desc
+from sqlalchemy.orm import selectinload
 from pgvector.sqlalchemy import Vector
 from openai import AzureOpenAI
 from typing import Optional, List, Dict, Any
@@ -11,9 +11,7 @@ from universal_mcp_markitdown.app import MarkitdownApp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from universal_mcp_context_temp.settings import settings
 from datetime import datetime, timezone
-import uuid
 
-# 8. Full text support ( vector + text) , hybrid search
 
 client = AzureOpenAI(
     api_version=settings.embedding_api_version,
@@ -68,6 +66,11 @@ class DocumentChunk(SQLModel, table=True):
             postgresql_using='hnsw',
             postgresql_with={'m': 16, 'ef_construction': 64},
             postgresql_ops={'embedding': 'vector_cosine_ops'}
+        ),
+        Index(
+            'fts_index_on_content',
+            func.to_tsvector('english', 'content'),
+            postgresql_using='gin'
         ),
     )
 
@@ -338,6 +341,144 @@ class ContextApp(APIApplication):
                 })
             return output
         
+    def search(self, project: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+        """
+        Performs a hybrid search using both vector similarity (for semantic meaning)
+        and full-text search (for keyword matching), with advanced metadata filtering.
+        Results are combined using Reciprocal Rank Fusion (RRF).
+        The metadata_filter should be a list of dictionaries, where each dictionary
+        defines a single condition.
+        Supported operators ('op'):
+        - '==' or 'eq': Equals (for strings or numbers)
+        - '!=' or 'ne': Not Equals
+        - '>' or 'gt': Greater Than (for numbers)
+        - '>=' or 'gte': Greater Than or Equal To (for numbers)
+        - '<' or 'lt': Less Than (for numbers)
+        - '<=' or 'lte': Less Than or Equal To (for numbers)
+        - 'in': Value is in a list (e.g., {"field": "type", "op": "in", "value": ["pdf", "txt"]})
+        For example, metadata_filter = [
+            {"field": "author", "op": "==", "value": "Ankit Ranjan"},
+            {"field": "chunk_number", "op": ">", "value": 5}
+        ]
+
+        Args:
+            project (str): The name of the project to search within.
+            query (str): The query string to find similar documents.
+            top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
+            metadata_filter (List[Dict], optional): A list of filter conditions to apply.
+
+        Returns:
+            List[dict]: A list of dictionaries representing the similar document chunks.
+            
+        Tags:
+            query, important, hybrid
+        """
+        query_embedding = generate_embedding(query)
+        tsquery = func.plainto_tsquery('english', query)
+        k_reciprocal = 60  # RRF ranking constant
+
+        with get_session() as session:
+            # 1. Build a list of filter clauses from the metadata_filter argument
+            filter_clauses = [SourceDocument.project == project]
+            if metadata_filter:
+                for condition in metadata_filter:
+                    field = condition.get("field")
+                    op = condition.get("op", "==").lower()
+                    value = condition.get("value")
+
+                    if not all([field, op, value is not None]):
+                        continue
+                    
+                    json_field = SourceDocument.meta[field]
+                    clause = None
+                    if op in ('>', 'gt', '>=', 'gte', '<', 'lt', '<=', 'lte'):
+                        numeric_field = cast(json_field.as_string(), Float)
+                        if op in ('>', 'gt'): clause = numeric_field > value
+                        elif op in ('>=', 'gte'): clause = numeric_field >= value
+                        elif op in ('<', 'lt'): clause = numeric_field < value
+                        elif op in ('<=', 'lte'): clause = numeric_field <= value
+                    elif op == 'in':
+                        if isinstance(value, list):
+                            clause = json_field.as_string().in_([str(v) for v in value])
+                    elif op in ('!=', 'ne'):
+                        clause = json_field.as_string() != str(value)
+                    else:  # Default case for '==' or 'eq'
+                        clause = json_field.as_string() == str(value)
+                    
+                    if clause is not None:
+                        filter_clauses.append(clause)
+
+            # 2. Vector Search CTE: Rank documents by cosine distance
+            vector_search_cte = (
+                select(
+                    DocumentChunk.id.label("id"),
+                    func.row_number().over(
+                        order_by=DocumentChunk.embedding.cosine_distance(query_embedding)
+                    ).label("rank")
+                )
+                .join(SourceDocument)
+                .where(*filter_clauses)
+                .cte("vector_search")
+            )
+
+            # 3. Full-Text Search (FTS) CTE: Rank documents by text relevance
+            fts_filter_clauses = filter_clauses + [
+                func.to_tsvector('english', DocumentChunk.content).op('@@')(tsquery)
+            ]
+            fts_search_cte = (
+                select(
+                    DocumentChunk.id.label("id"),
+                    func.row_number().over(
+                        order_by=func.ts_rank(
+                            func.to_tsvector('english', DocumentChunk.content),
+                            tsquery
+                        ).desc()
+                    ).label("rank")
+                )
+                .join(SourceDocument)
+                .where(*fts_filter_clauses)
+                .cte("fts_search")
+            )
+
+            # 4. Combine results with Reciprocal Rank Fusion (RRF)
+            all_chunk_ids = select(vector_search_cte.c.id).union(select(fts_search_cte.c.id)).subquery()
+
+            final_stmt = (
+                select(
+                    DocumentChunk,
+                    (
+                        func.coalesce(1.0 / (k_reciprocal + vector_search_cte.c.rank), 0.0) +
+                        func.coalesce(1.0 / (k_reciprocal + fts_search_cte.c.rank), 0.0)
+                    ).label("rrf_score")
+                )
+                .join(all_chunk_ids, DocumentChunk.id == all_chunk_ids.c.id)
+                .outerjoin(vector_search_cte, DocumentChunk.id == vector_search_cte.c.id)
+                .outerjoin(fts_search_cte, DocumentChunk.id == fts_search_cte.c.id)
+                .options(selectinload(DocumentChunk.source_document))  # Eager load parent document
+                .order_by(desc("rrf_score"))
+                .limit(top_k)
+            )
+
+            # 5. Execute query and format the output
+            results = session.exec(final_stmt).all()
+            
+            output = []
+            for row in results:
+                chunk = row.DocumentChunk
+                output.append({
+                    "chunk_id": chunk.id,
+                    "content": chunk.content,
+                    "chunk_sequence": chunk.chunk_sequence,
+                    "chunk_meta": chunk.meta,
+                    "source_document": {
+                        "id": chunk.source_document.id,
+                        "project": chunk.source_document.project,
+                        "filepath": chunk.source_document.filepath,
+                        "meta": chunk.source_document.meta,
+                    }
+                })
+            return output
+        
     def list_projects(self) -> List[str]:
         """
         Lists all unique project names available in the context.
@@ -415,11 +556,12 @@ class ContextApp(APIApplication):
     def list_tools(self):
         
         return [
-            self.insert_document_from_file,
-            self.insert_document_from_content, 
-            self.delete_document, 
-            self.query_similar,
+            # self.insert_document_from_file,
+            # self.insert_document_from_content, 
+            # self.delete_document, 
+            # self.query_similar,
             self.list_projects,
-            self.list_documents_in_project,
+            # self.list_documents_in_project,
             self.list_documents,
+            self.search,
         ]
