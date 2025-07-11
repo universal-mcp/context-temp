@@ -82,8 +82,8 @@ class SourceDocument(SQLModel, table=True):
     __tablename__ = "source_documents"
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    project: str = Field(index=True)
-    filepath: str = Field(index=True) # Unique within a project
+    collection: str = Field(index=True)
+    filepath: str = Field(index=True) # Unique within a collection
     chunk_count: int = Field(default=0)
     meta: dict = Field(default_factory=dict, sa_type=JSON)
     
@@ -92,7 +92,7 @@ class SourceDocument(SQLModel, table=True):
     
     chunks: List[DocumentChunk] = Relationship(back_populates="source_document", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
-    __table_args__ = (UniqueConstraint('project', 'filepath', name='_project_filepath_uc'),)
+    __table_args__ = (UniqueConstraint('collection', 'filepath', name='_collection_filepath_uc'),)
 
 
 class ContextApp(APIApplication):
@@ -102,12 +102,12 @@ class ContextApp(APIApplication):
     def __init__(self, integration: Integration = None, **kwargs) -> None:
         super().__init__(name="context", integration=integration, **kwargs)
 
-    def _get_or_create_source_document(self, session: Session, project: str, filepath: str, metadata: dict) -> SourceDocument:
+    def _get_or_create_source_document(self, session: Session, collection: str, filepath: str, metadata: dict) -> SourceDocument:
         """
         Helper function to either retrieve an existing document or create a new one.
         If the document already exists, its old chunks are deleted.
         """
-        stmt = select(SourceDocument).where(SourceDocument.project == project, SourceDocument.filepath == filepath)
+        stmt = select(SourceDocument).where(SourceDocument.collection == collection, SourceDocument.filepath == filepath)
         existing_doc = session.exec(stmt).first()
 
         if existing_doc:
@@ -118,7 +118,7 @@ class ContextApp(APIApplication):
         else:
             # Document does not exist, create a new one
             new_doc = SourceDocument(
-                project=project,
+                collection=collection,
                 filepath=filepath,
                 meta=metadata or {},
                 created_at=datetime.now(timezone.utc),
@@ -127,7 +127,7 @@ class ContextApp(APIApplication):
             session.add(new_doc)
             return new_doc
 
-    def _process_and_store_document(self, session: Session, project: str, source_identifier: str, content: str, metadata: Optional[dict]) -> int:
+    def _process_and_store_document(self, session: Session, collection: str, source_identifier: str, content: str, metadata: Optional[dict]) -> int:
         """
         Internal helper to process content, create chunks, and store in the database.
         """
@@ -135,7 +135,7 @@ class ContextApp(APIApplication):
         chunks = text_splitter.split_text(content)
 
         # Get or create the parent document, clearing old chunks if it exists
-        source_doc = self._get_or_create_source_document(session, project, source_identifier, metadata)
+        source_doc = self._get_or_create_source_document(session, collection, source_identifier, metadata)
         
         # We need the ID for the foreign key, so commit and refresh
         session.commit()
@@ -165,15 +165,15 @@ class ContextApp(APIApplication):
         
         return source_doc.id
 
-    async def insert_document_from_file(self, project: str, filepath: str, metadata: Optional[dict] = None) -> int:
+    async def insert_document_from_file(self, collection: str, filepath: str, metadata: Optional[dict] = None) -> int:
         """
         Adds or updates a document in the context from a file path.
         The content will be loaded from the specified path, and the `filepath` itself 
-        will serve as the unique identifier within the project. If a document with the 
-        same `project` and `filepath` already exists, its content and metadata will be updated.
+        will serve as the unique identifier within the collection. If a document with the 
+        same `collection` and `filepath` already exists, its content and metadata will be updated.
 
         Args:
-            project (str): The name of the project to associate with the document.
+            collection (str): The name of the collection to associate with the document.
             filepath (str): The path to the document (e.g., local file path, URL).
             metadata (dict, optional): Base metadata for the source document.
 
@@ -194,23 +194,23 @@ class ContextApp(APIApplication):
         with get_session() as session:
             doc_id = self._process_and_store_document(
                 session=session,
-                project=project,
+                collection=collection,
                 source_identifier=filepath,
                 content=content,
                 metadata=metadata
             )
             return doc_id
 
-    async def insert_document_from_content(self, project: str, content: str, filename: str, metadata: Optional[dict] = None) -> int:
+    async def insert_document_from_content(self, collection: str, content: str, filename: str, metadata: Optional[dict] = None) -> int:
         """
         Adds or updates a document in the context from raw content.
         You must provide the document's `content` directly and a `filename` which 
-        will serve as the unique identifier within the project. This allows for readable
+        will serve as the unique identifier within the collection. This allows for readable
         identification and enables future updates to the document by referencing the 
-        same `project` and `filename`.
+        same `collection` and `filename`.
 
         Args:
-            project (str): The name of the project to associate with the document.
+            collection (str): The name of the collection to associate with the document.
             content (str): The raw text content of the document.
             filename (str): A unique name for the document. This is used as the `filepath` 
                             identifier in the database.
@@ -225,7 +225,7 @@ class ContextApp(APIApplication):
         with get_session() as session:
             doc_id = self._process_and_store_document(
                 session=session,
-                project=project,
+                collection=collection,
                 source_identifier=filename,
                 content=content,
                 metadata=metadata
@@ -255,7 +255,7 @@ class ContextApp(APIApplication):
             
             return False
             
-    def query_similar(self, project: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+    def query_similar(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Queries the context for similar documents, with advanced metadata filtering.
         The metadata_filter should be a list of dictionaries, where each dictionary
@@ -274,7 +274,7 @@ class ContextApp(APIApplication):
         ]
 
         Args:
-            project (str): The name of the project to search within.
+            collection (str): The name of the collection to search within.
             query (str): The query string to find similar documents.
             top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
             metadata_filter (List[Dict], optional): A list of filter conditions to apply.
@@ -290,7 +290,7 @@ class ContextApp(APIApplication):
         with get_session() as session:
             stmt = select(DocumentChunk).join(SourceDocument)
 
-            stmt = stmt.where(SourceDocument.project == project)
+            stmt = stmt.where(SourceDocument.collection == collection)
 
             if metadata_filter:
                 for condition in metadata_filter:
@@ -334,14 +334,14 @@ class ContextApp(APIApplication):
                     "chunk_meta": chunk.meta,
                     "source_document": {
                         "id": chunk.source_document.id,
-                        "project": chunk.source_document.project,
+                        "collection": chunk.source_document.collection,
                         "filepath": chunk.source_document.filepath,
                         "meta": chunk.source_document.meta,
                     }
                 })
             return output
         
-    def search(self, project: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+    def search(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
         """
         Performs a hybrid search using both vector similarity (for semantic meaning)
         and full-text search (for keyword matching), with advanced metadata filtering.
@@ -362,7 +362,7 @@ class ContextApp(APIApplication):
         ]
 
         Args:
-            project (str): The name of the project to search within.
+            collection (str): The name of the collection to search within.
             query (str): The query string to find similar documents.
             top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
             metadata_filter (List[Dict], optional): A list of filter conditions to apply.
@@ -379,7 +379,7 @@ class ContextApp(APIApplication):
 
         with get_session() as session:
             # 1. Build a list of filter clauses from the metadata_filter argument
-            filter_clauses = [SourceDocument.project == project]
+            filter_clauses = [SourceDocument.collection == collection]
             if metadata_filter:
                 for condition in metadata_filter:
                     field = condition.get("field")
@@ -472,35 +472,35 @@ class ContextApp(APIApplication):
                     "chunk_meta": chunk.meta,
                     "source_document": {
                         "id": chunk.source_document.id,
-                        "project": chunk.source_document.project,
+                        "collection": chunk.source_document.collection,
                         "filepath": chunk.source_document.filepath,
                         "meta": chunk.source_document.meta,
                     }
                 })
             return output
         
-    def list_projects(self) -> List[str]:
+    def list_collections(self) -> List[str]:
         """
-        Lists all unique project names available in the context.
+        Lists all unique collection names available in the context.
 
         Returns:
-            List[str]: A list of unique project names.
+            List[str]: A list of unique collection names.
         
         Tags:
-            list, query, project, important
+            list, query, collection, important
         """
         with get_session() as session:
-            stmt = select(SourceDocument.project).distinct()
+            stmt = select(SourceDocument.collection).distinct()
             results = session.exec(stmt).all()
 
             return results
 
-    def list_documents_in_project(self, project: str) -> List[Dict[str, Any]]:
+    def list_documents_in_collection(self, collection: str) -> List[Dict[str, Any]]:
         """
-        Lists all documents (and their metadata) within a specific project.
+        Lists all documents (and their metadata) within a specific collection.
 
         Args:
-            project (str): The name of the project to list documents for.
+            collection (str): The name of the collection to list documents for.
 
         Returns:
             List[Dict[str, Any]]: A list of dictionaries, each representing a document
@@ -510,7 +510,7 @@ class ContextApp(APIApplication):
             list, query, document, important
         """
         with get_session() as session:
-            stmt = select(SourceDocument).where(SourceDocument.project == project).order_by(SourceDocument.filepath)
+            stmt = select(SourceDocument).where(SourceDocument.collection == collection).order_by(SourceDocument.filepath)
             documents = session.exec(stmt).all()
             
             return [
@@ -527,23 +527,23 @@ class ContextApp(APIApplication):
             
     def list_documents(self) -> List[Dict[str, Any]]:
         """
-        Lists all documents across all projects available in the context.
+        Lists all documents across all collections available in the context.
 
         Returns:
             List[Dict[str, Any]]: A list of dictionaries, each representing a document
-                                  with its ID, project, filepath, and other metadata.
+                                  with its ID, collection, filepath, and other metadata.
         
         Tags:
             list, query, document, important
         """
         with get_session() as session:
-            stmt = select(SourceDocument).order_by(SourceDocument.project, SourceDocument.filepath)
+            stmt = select(SourceDocument).order_by(SourceDocument.collection, SourceDocument.filepath)
             documents = session.exec(stmt).all()
             
             return [
                 {
                     "id": doc.id,
-                    "project": doc.project, # Include the project name for clarity
+                    "collection": doc.collection, # Include the collection name for clarity
                     "filepath": doc.filepath,
                     # "chunk_count": doc.chunk_count,
                     # "meta": doc.meta,
@@ -560,8 +560,8 @@ class ContextApp(APIApplication):
             # self.insert_document_from_content, 
             # self.delete_document, 
             # self.query_similar,
-            self.list_projects,
-            # self.list_documents_in_project,
+            self.list_collections,
+            # self.list_documents_in_collection,
             self.list_documents,
             self.search,
         ]
