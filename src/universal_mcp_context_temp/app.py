@@ -2,7 +2,7 @@ from universal_mcp.applications import APIApplication
 from universal_mcp.integrations import Integration
 from contextlib import contextmanager
 from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
-from sqlalchemy import JSON, cast, Float, func, Index, UniqueConstraint, desc
+from sqlalchemy import JSON, cast, Float, func, Index, UniqueConstraint, desc, text
 from sqlalchemy.orm import selectinload
 from pgvector.sqlalchemy import Vector
 from openai import AzureOpenAI
@@ -69,7 +69,7 @@ class DocumentChunk(SQLModel, table=True):
         ),
         Index(
             'fts_index_on_content',
-            func.to_tsvector('english', 'content'),
+            text("to_tsvector('english', content)"),
             postgresql_using='gin'
         ),
     )
