@@ -562,6 +562,6 @@ class ContextApp(APIApplication):
             # self.query_similar,
             self.list_collections,
             # self.list_documents_in_collection,
-            self.list_documents,
+            # self.list_documents,
             self.search,
         ]
