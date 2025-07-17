@@ -23,11 +23,15 @@ classifiers = [
 # Add runtime dependencies here if any are known upfront
 dependencies = [
     "httpx-aiohttp>=0.1.8",
+    "langchain>=0.3.26",
+    "langchain-openai>=0.3.28",
     "langchain-text-splitters>=0.3.8",
+    "litellm>=1.73.6.post1",
     "openai>=1.93.0",
     "pgvector>=0.4.1",
     "psycopg2-binary>=2.9.10",
     "pydantic-settings>=2.10.1",
+    "python-dotenv>=1.1.1",
     "sqlalchemy>=2.0.41",
     "sqlmodel>=0.0.24",
     "universal-mcp-markitdown>=0.1.1",

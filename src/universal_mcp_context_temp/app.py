@@ -11,9 +11,11 @@ from universal_mcp_markitdown.app import MarkitdownApp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from universal_mcp_context_temp.settings import settings
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
 
-
-client = AzureOpenAI(
+embedding_client = AzureOpenAI(
     api_version=settings.embedding_api_version,
     azure_endpoint=settings.azure_openai_endpoint,
     api_key=settings.azure_openai_api_key,
@@ -29,11 +31,30 @@ def get_engine():
     return _engine
 
 def generate_embedding(text: str):
-    embedding = client.embeddings.create(
+    embedding = embedding_client.embeddings.create(
         input=[text],
         model=settings.embedding_model_name,
     )
     return embedding.data[0].embedding
+
+def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """
+    Generates embeddings for a list of texts in a single, efficient API call.
+
+    Args:
+        texts (List[str]): A list of text strings to embed.
+
+    Returns:
+        List[List[float]]: A list of embedding vectors.
+    """
+    if not texts:
+        return []
+
+    embedding = embedding_client.embeddings.create(
+        input=texts,
+        model=settings.embedding_model_name,
+    )
+    return [item.embedding for item in embedding.data]
 
 @contextmanager
 def get_session():
@@ -102,6 +123,41 @@ class ContextApp(APIApplication):
     def __init__(self, integration: Integration = None, **kwargs) -> None:
         super().__init__(name="context", integration=integration, **kwargs)
 
+        self.chat_llm = AzureChatOpenAI(
+            openai_api_version=settings.embedding_api_version,
+            deployment_name=settings.chat_model_name,
+            temperature=0.2,
+            max_retries=3,
+        )
+
+    def _generate_contextual_text(self, full_document_content: str, chunk_content: str) -> str:
+        """
+        Calls an LLM via LangChain to generate context for a chunk based on the full document.
+        """
+        try:
+            prompt_text = f"""Given the full document below, provide a short, succinct context to situate the following chunk within it. This will be used to improve search retrieval of the chunk. Answer only with the context and nothing else.
+
+<document>
+{full_document_content[:20000]}
+</document>
+
+<chunk>
+{chunk_content}
+</chunk>
+"""
+            messages = [
+                SystemMessage(content="You are a helpful assistant that provides concise contextual information for text chunks."),
+                HumanMessage(content=prompt_text),
+            ]
+            response = self.chat_llm.invoke(messages)
+
+            generated_context = response.content.strip()
+            return f"{generated_context}\n---\n{chunk_content}"
+
+        except Exception as e:
+            print(f"Warning: Failed to generate context for chunk. Reason: {e}. Using original chunk for embedding.")
+            return chunk_content
+
     def _get_or_create_source_document(self, session: Session, collection: str, filepath: str, metadata: dict) -> SourceDocument:
         """
         Helper function to either retrieve an existing document or create a new one.
@@ -112,6 +168,7 @@ class ContextApp(APIApplication):
 
         if existing_doc:
             existing_doc.chunks.clear()
+            session.flush() # Persist the deletion of old chunks
             existing_doc.meta = metadata # Update metadata
             existing_doc.updated_at = datetime.now(timezone.utc)
             return existing_doc
@@ -129,26 +186,35 @@ class ContextApp(APIApplication):
 
     def _process_and_store_document(self, session: Session, collection: str, source_identifier: str, content: str, metadata: Optional[dict]) -> int:
         """
-        Internal helper to process content, create chunks, and store in the database.
+        Internal helper to process content, create contextual embeddings, and store in the database.
         """
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(content)
 
-        # Get or create the parent document, clearing old chunks if it exists
+        if not chunks:
+            return None # No content to process
+
         source_doc = self._get_or_create_source_document(session, collection, source_identifier, metadata)
         
-        # We need the ID for the foreign key, so commit and refresh
         session.commit()
         session.refresh(source_doc)
 
+        enriched_texts_for_embedding = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(self._generate_contextual_text, content, chunk) for chunk in chunks]
+            for future in futures:
+                enriched_texts_for_embedding.append(future.result())
+
+        embeddings = generate_embeddings_batch(enriched_texts_for_embedding)
+
         new_chunks = []
-        for i, chunk_content in enumerate(chunks):
-            embedding = generate_embedding(chunk_content)
+        for i, original_chunk_content in enumerate(chunks):
             chunk = DocumentChunk(
                 source_document_id=source_doc.id,
-                content=chunk_content,
-                embedding=embedding,
-                chunk_sequence=i + 1
+                content=original_chunk_content,
+                embedding=embeddings[i],
+                chunk_sequence=i + 1,
+                meta={"embedding_strategy": "contextual"} # Add metadata to track strategy
             )
             new_chunks.append(chunk)
 
@@ -200,6 +266,150 @@ class ContextApp(APIApplication):
                 metadata=metadata
             )
             return doc_id
+        
+    def search(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
+        """
+        Performs a hybrid search using both vector similarity (for semantic meaning)
+        and full-text search (for keyword matching), with advanced metadata filtering.
+        Results are combined using Reciprocal Rank Fusion (RRF).
+        The metadata_filter should be a list of dictionaries, where each dictionary
+        defines a single condition.
+        Supported operators ('op'):
+        - '==' or 'eq': Equals (for strings or numbers)
+        - '!=' or 'ne': Not Equals
+        - '>' or 'gt': Greater Than (for numbers)
+        - '>=' or 'gte': Greater Than or Equal To (for numbers)
+        - '<' or 'lt': Less Than (for numbers)
+        - '<=' or 'lte': Less Than or Equal To (for numbers)
+        - 'in': Value is in a list (e.g., {"field": "type", "op": "in", "value": ["pdf", "txt"]})
+        For example, metadata_filter = [
+            {"field": "author", "op": "==", "value": "Ankit Ranjan"},
+            {"field": "chunk_number", "op": ">", "value": 5}
+        ]
+
+        Args:
+            collection (str): The name of the collection to search within.
+            query (str): The query string to find similar documents.
+            top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
+            metadata_filter (List[Dict], optional): A list of filter conditions to apply.
+
+        Returns:
+            List[dict]: A list of dictionaries representing the similar document chunks.
+            
+        Tags:
+            query, important, hybrid
+        """
+        enriched_query_for_embedding = f"Search query: {query}" # Simple enrichment, can be more complex
+        query_embedding = generate_embeddings_batch([enriched_query_for_embedding])[0]
+
+        tsquery = func.plainto_tsquery('english', query)
+        k_reciprocal = 60  # RRF ranking constant
+
+        with get_session() as session:
+            # 1. Build a list of filter clauses from the metadata_filter argument
+            filter_clauses = [SourceDocument.collection == collection]
+            if metadata_filter:
+                for condition in metadata_filter:
+                    field = condition.get("field")
+                    op = condition.get("op", "==").lower()
+                    value = condition.get("value")
+
+                    if not all([field, op, value is not None]):
+                        continue
+                    
+                    json_field = SourceDocument.meta[field]
+                    clause = None
+                    if op in ('>', 'gt', '>=', 'gte', '<', 'lt', '<=', 'lte'):
+                        numeric_field = cast(json_field.as_string(), Float)
+                        if op in ('>', 'gt'): 
+                            clause = numeric_field > value
+                        elif op in ('>=', 'gte'): 
+                            clause = numeric_field >= value
+                        elif op in ('<', 'lt'): 
+                            clause = numeric_field < value
+                        elif op in ('<=', 'lte'): 
+                            clause = numeric_field <= value
+                    elif op == 'in':
+                        if isinstance(value, list):
+                            clause = json_field.as_string().in_([str(v) for v in value])
+                    elif op in ('!=', 'ne'):
+                        clause = json_field.as_string() != str(value)
+                    else:  # Default case for '==' or 'eq'
+                        clause = json_field.as_string() == str(value)
+                    
+                    if clause is not None:
+                        filter_clauses.append(clause)
+
+            # 2. Vector Search CTE: Rank documents by cosine distance
+            vector_search_cte = (
+                select(
+                    DocumentChunk.id.label("id"),
+                    func.row_number().over(
+                        order_by=DocumentChunk.embedding.cosine_distance(query_embedding)
+                    ).label("rank")
+                )
+                .join(SourceDocument)
+                .where(*filter_clauses)
+                .cte("vector_search")
+            )
+
+            # 3. Full-Text Search (FTS) CTE: Rank documents by text relevance
+            fts_filter_clauses = filter_clauses + [
+                func.to_tsvector('english', DocumentChunk.content).op('@@')(tsquery)
+            ]
+            fts_search_cte = (
+                select(
+                    DocumentChunk.id.label("id"),
+                    func.row_number().over(
+                        order_by=func.ts_rank(
+                            func.to_tsvector('english', DocumentChunk.content),
+                            tsquery
+                        ).desc()
+                    ).label("rank")
+                )
+                .join(SourceDocument)
+                .where(*fts_filter_clauses)
+                .cte("fts_search")
+            )
+
+            # 4. Combine results with Reciprocal Rank Fusion (RRF)
+            all_chunk_ids = select(vector_search_cte.c.id).union(select(fts_search_cte.c.id)).subquery()
+
+            final_stmt = (
+                select(
+                    DocumentChunk,
+                    (
+                        func.coalesce(1.0 / (k_reciprocal + vector_search_cte.c.rank), 0.0) +
+                        func.coalesce(1.0 / (k_reciprocal + fts_search_cte.c.rank), 0.0)
+                    ).label("rrf_score")
+                )
+                .join(all_chunk_ids, DocumentChunk.id == all_chunk_ids.c.id)
+                .outerjoin(vector_search_cte, DocumentChunk.id == vector_search_cte.c.id)
+                .outerjoin(fts_search_cte, DocumentChunk.id == fts_search_cte.c.id)
+                .options(selectinload(DocumentChunk.source_document))  # Eager load parent document
+                .order_by(desc("rrf_score"))
+                .limit(top_k)
+            )
+
+            # 5. Execute query and format the output
+            results = session.exec(final_stmt).all()
+            
+            output = []
+            for row in results:
+                chunk = row.DocumentChunk
+                output.append({
+                    "chunk_id": chunk.id,
+                    "content": chunk.content,
+                    "chunk_sequence": chunk.chunk_sequence,
+                    "chunk_meta": chunk.meta,
+                    "source_document": {
+                        "id": chunk.source_document.id,
+                        "collection": chunk.source_document.collection,
+                        "filepath": chunk.source_document.filepath,
+                        "meta": chunk.source_document.meta,
+                    }
+                })
+            return output
 
     async def insert_document_from_content(self, collection: str, content: str, filename: str, metadata: Optional[dict] = None) -> int:
         """
@@ -340,145 +550,7 @@ class ContextApp(APIApplication):
                     }
                 })
             return output
-        
-    def search(self, collection: str, query: str, top_k: int = 5, metadata_filter: List[Dict[str, Any]] = None) -> List[dict]:
-        """
-        Performs a hybrid search using both vector similarity (for semantic meaning)
-        and full-text search (for keyword matching), with advanced metadata filtering.
-        Results are combined using Reciprocal Rank Fusion (RRF).
-        The metadata_filter should be a list of dictionaries, where each dictionary
-        defines a single condition.
-        Supported operators ('op'):
-        - '==' or 'eq': Equals (for strings or numbers)
-        - '!=' or 'ne': Not Equals
-        - '>' or 'gt': Greater Than (for numbers)
-        - '>=' or 'gte': Greater Than or Equal To (for numbers)
-        - '<' or 'lt': Less Than (for numbers)
-        - '<=' or 'lte': Less Than or Equal To (for numbers)
-        - 'in': Value is in a list (e.g., {"field": "type", "op": "in", "value": ["pdf", "txt"]})
-        For example, metadata_filter = [
-            {"field": "author", "op": "==", "value": "Ankit Ranjan"},
-            {"field": "chunk_number", "op": ">", "value": 5}
-        ]
-
-        Args:
-            collection (str): The name of the collection to search within.
-            query (str): The query string to find similar documents.
-            top_k (int, optional): The maximum number of similar documents to return. Defaults to 5.
-            metadata_filter (List[Dict], optional): A list of filter conditions to apply.
-
-        Returns:
-            List[dict]: A list of dictionaries representing the similar document chunks.
-            
-        Tags:
-            query, important, hybrid
-        """
-        query_embedding = generate_embedding(query)
-        tsquery = func.plainto_tsquery('english', query)
-        k_reciprocal = 60  # RRF ranking constant
-
-        with get_session() as session:
-            # 1. Build a list of filter clauses from the metadata_filter argument
-            filter_clauses = [SourceDocument.collection == collection]
-            if metadata_filter:
-                for condition in metadata_filter:
-                    field = condition.get("field")
-                    op = condition.get("op", "==").lower()
-                    value = condition.get("value")
-
-                    if not all([field, op, value is not None]):
-                        continue
-                    
-                    json_field = SourceDocument.meta[field]
-                    clause = None
-                    if op in ('>', 'gt', '>=', 'gte', '<', 'lt', '<=', 'lte'):
-                        numeric_field = cast(json_field.as_string(), Float)
-                        if op in ('>', 'gt'): clause = numeric_field > value
-                        elif op in ('>=', 'gte'): clause = numeric_field >= value
-                        elif op in ('<', 'lt'): clause = numeric_field < value
-                        elif op in ('<=', 'lte'): clause = numeric_field <= value
-                    elif op == 'in':
-                        if isinstance(value, list):
-                            clause = json_field.as_string().in_([str(v) for v in value])
-                    elif op in ('!=', 'ne'):
-                        clause = json_field.as_string() != str(value)
-                    else:  # Default case for '==' or 'eq'
-                        clause = json_field.as_string() == str(value)
-                    
-                    if clause is not None:
-                        filter_clauses.append(clause)
-
-            # 2. Vector Search CTE: Rank documents by cosine distance
-            vector_search_cte = (
-                select(
-                    DocumentChunk.id.label("id"),
-                    func.row_number().over(
-                        order_by=DocumentChunk.embedding.cosine_distance(query_embedding)
-                    ).label("rank")
-                )
-                .join(SourceDocument)
-                .where(*filter_clauses)
-                .cte("vector_search")
-            )
-
-            # 3. Full-Text Search (FTS) CTE: Rank documents by text relevance
-            fts_filter_clauses = filter_clauses + [
-                func.to_tsvector('english', DocumentChunk.content).op('@@')(tsquery)
-            ]
-            fts_search_cte = (
-                select(
-                    DocumentChunk.id.label("id"),
-                    func.row_number().over(
-                        order_by=func.ts_rank(
-                            func.to_tsvector('english', DocumentChunk.content),
-                            tsquery
-                        ).desc()
-                    ).label("rank")
-                )
-                .join(SourceDocument)
-                .where(*fts_filter_clauses)
-                .cte("fts_search")
-            )
-
-            # 4. Combine results with Reciprocal Rank Fusion (RRF)
-            all_chunk_ids = select(vector_search_cte.c.id).union(select(fts_search_cte.c.id)).subquery()
-
-            final_stmt = (
-                select(
-                    DocumentChunk,
-                    (
-                        func.coalesce(1.0 / (k_reciprocal + vector_search_cte.c.rank), 0.0) +
-                        func.coalesce(1.0 / (k_reciprocal + fts_search_cte.c.rank), 0.0)
-                    ).label("rrf_score")
-                )
-                .join(all_chunk_ids, DocumentChunk.id == all_chunk_ids.c.id)
-                .outerjoin(vector_search_cte, DocumentChunk.id == vector_search_cte.c.id)
-                .outerjoin(fts_search_cte, DocumentChunk.id == fts_search_cte.c.id)
-                .options(selectinload(DocumentChunk.source_document))  # Eager load parent document
-                .order_by(desc("rrf_score"))
-                .limit(top_k)
-            )
-
-            # 5. Execute query and format the output
-            results = session.exec(final_stmt).all()
-            
-            output = []
-            for row in results:
-                chunk = row.DocumentChunk
-                output.append({
-                    "chunk_id": chunk.id,
-                    "content": chunk.content,
-                    "chunk_sequence": chunk.chunk_sequence,
-                    "chunk_meta": chunk.meta,
-                    "source_document": {
-                        "id": chunk.source_document.id,
-                        "collection": chunk.source_document.collection,
-                        "filepath": chunk.source_document.filepath,
-                        "meta": chunk.source_document.meta,
-                    }
-                })
-            return output
-        
+             
     def list_collections(self) -> List[str]:
         """
         Lists all unique collection names available in the context.
@@ -560,7 +632,7 @@ class ContextApp(APIApplication):
             # self.insert_document_from_content, 
             # self.delete_document, 
             # self.query_similar,
-            self.list_collections,
+            # self.list_collections,
             # self.list_documents_in_collection,
             # self.list_documents,
             self.search,
